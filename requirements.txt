@@ -1,0 +1,16 @@
+python-frontmatter
+langchain
+langchain-openai
+langchain-community
+langchain-ollama
+langgraph
+faiss-cpu
+rank-bm25
+tiktoken
+python-dotenv
+# For local models via Ollama (install Ollama separately)
+ollama
+# Optional: for HuggingFace embeddings if not using Ollama
+sentence-transformers
+transformers
+torch
