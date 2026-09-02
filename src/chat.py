@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
 Simple RAG chatbot for OP branch information.
-Uses hybrid retriever + local LLM (Qwen) with optional reranking.
+Uses hybrid retriever + local LLM with optional reranking (BGE-Reranker-v2-M3).
 """
 import argparse
 import pickle
 from pathlib import Path
-import requests
 
 from langchain_community.vectorstores import FAISS
 from langchain_community.retrievers import BM25Retriever
@@ -15,12 +14,8 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_ollama import ChatOllama, OllamaEmbeddings
 
-try:
-    from transformers import AutoTokenizer, AutoModelForSequenceClassification
-    import torch
-    HF_RERANKER_AVAILABLE = True
-except ImportError:
-    HF_RERANKER_AVAILABLE = False
+# Local reranker
+from FlagEmbedding import FlagReranker
 
 
 def load_index(
@@ -92,9 +87,9 @@ def format_docs(docs):
         url = doc.metadata.get("url", "")
         content = doc.page_content
         if url:
-            formatted.append(f"--- SOURCE: {source} ---\nURL: {url}\n{content}\n--- END SOURCE ---")
+            formatted.append(f"--- LÄHDE: {source} ---\nURL: {url}\n{content}\n--- LÄHTEEN LOPPU ---")
         else:
-            formatted.append(f"--- SOURCE: {source} ---\n{content}\n--- END SOURCE ---")
+            formatted.append(f"--- LÄHDE: {source} ---\n{content}\n--- LÄHTEEN LOPPU ---")
     return "\n\n".join(formatted)
 
 
@@ -109,71 +104,27 @@ def expand_query(query: str) -> str:
 
 
 class Reranker:
-    def __init__(self, model_name: str = "nvidia/llama-nemotron-rerank-1b-v2", 
-                 server_url: str = "http://localhost:8000",
-                 use_server: bool = True):
-        self.model_name = model_name
-        self.server_url = server_url
-        self.use_server = use_server
-        
-        if not use_server and HF_RERANKER_AVAILABLE:
-            self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-            self.model = AutoModelForSequenceClassification.from_pretrained(model_name, trust_remote_code=True)
-            self.model.eval()
-            if torch.cuda.is_available():
-                self.model = self.model.cuda()
-    
+    def __init__(self, model_name: str = "BAAI/bge-reranker-v2-m3", use_fp16: bool = True):
+        """
+        Local reranker using BGE-Reranker-v2-M3 (multilingual, excellent for Finnish).
+        """
+        try:
+            self.model = FlagReranker(model_name, use_fp16=use_fp16)
+            print(f"🔄 Loaded reranker: {model_name}")
+        except Exception as e:
+            raise RuntimeError(f"Failed to load reranker: {e}. Install FlagEmbedding: pip install -U FlagEmbedding")
+
     def rerank(self, query: str, documents: list, top_n: int = 5) -> list:
         if not documents:
             return documents
-            
-        if self.use_server:
-            return self._rerank_with_server(query, documents, top_n)
-        else:
-            return self._rerank_with_hf(query, documents, top_n)
-    
-    def _rerank_with_server(self, query: str, documents: list, top_n: int = 5) -> list:
-        try:
-            doc_texts = [doc.page_content for doc in documents]
-            response = requests.post(
-                f"{self.server_url}/rerank",
-                json={
-                    "model": self.model_name,
-                    "query": query,
-                    "documents": doc_texts,
-                    "top_n": top_n,
-                },
-                timeout=30,
-            )
-            response.raise_for_status()
-            results = response.json()["results"]
-            indices = [item["index"] for item in results]
-            return [documents[idx] for idx in indices]
-        except Exception:
-            return documents[:top_n]
-    
-    def _rerank_with_hf(self, query: str, documents: list, top_n: int = 5) -> list:
+
         try:
             pairs = [[query, doc.page_content] for doc in documents]
-            texts = [f"question:{q} \n \n passage:{p}" for q, p in pairs]
-            
-            inputs = self.tokenizer(
-                texts, 
-                padding=True, 
-                truncation=True, 
-                max_length=8192, 
-                return_tensors="pt"
-            )
-            
-            if torch.cuda.is_available():
-                inputs = {k: v.cuda() for k, v in inputs.items()}
-            
-            with torch.inference_mode():
-                logits = self.model(**inputs).logits.view(-1).tolist()
-            
-            scored = sorted(zip(documents, logits), key=lambda x: x[1], reverse=True)
+            scores = self.model.compute_score(pairs, normalize=True)
+            scored = sorted(zip(documents, scores), key=lambda x: x[1], reverse=True)
             return [doc for doc, _ in scored[:top_n]]
-        except Exception:
+        except Exception as e:
+            print(f"⚠️ Reranking failed: {e}. Returning top {top_n} original documents.")
             return documents[:top_n]
 
 
@@ -184,37 +135,40 @@ def create_rag_chain(
     openai_model: str = "gpt-4o-mini",
     system_prompt: str = "",
     rerank: bool = False,
-    rerank_server: str = "http://localhost:8000",
-    rerank_model: str = "nvidia/llama-nemotron-rerank-1b-v2",
-    use_server: bool = True,
     top_k_rerank: int = 5,
 ):
     if use_local:
-        llm = ChatOllama(model=local_model, temperature=0)
+        llm = ChatOllama(model=local_model, temperature=0.1, num_predict=200)
     else:
         from langchain_openai import ChatOpenAI
         llm = ChatOpenAI(model=openai_model, temperature=0)
 
     reranker = None
     if rerank:
-        reranker = Reranker(
-            model_name=rerank_model,
-            server_url=rerank_server,
-            use_server=use_server
-        )
+        reranker = Reranker()  # uses default BGE model
 
     def get_context(question):
         expanded = expand_query(question)
         docs = retriever.invoke(expanded)
-        
+
+        # Rerank if enabled
         if reranker is not None:
             docs = reranker.rerank(question, docs, top_n=top_k_rerank)
-        
+
+        # Truncate document content to avoid token overflow
+        MAX_DOCS = 5
+        MAX_CONTENT_LEN = 500
+        for doc in docs:
+            if len(doc.page_content) > MAX_CONTENT_LEN:
+                doc.page_content = doc.page_content[:MAX_CONTENT_LEN] + "..."
+        if len(docs) > MAX_DOCS:
+            docs = docs[:MAX_DOCS]
+
         return format_docs(docs)
 
     prompt = ChatPromptTemplate.from_messages([
         ("system", system_prompt),
-        ("human", "Context:\n{context}\n\nQuestion: {question}"),
+        ("human", "Konteksti:\n{context}\n\nKysymys: {question}"),
     ])
 
     chain = (
@@ -252,10 +206,7 @@ if __name__ == "__main__":
     parser.add_argument("--embedding-model", default=None, help="Override embedding model")
     parser.add_argument("--openai-model", default="gpt-4o-mini", help="OpenAI model name")
     parser.add_argument("--system-prompt", default="system_prompt.md", help="Path to system prompt file")
-    parser.add_argument("--rerank", action="store_true", help="Enable reranking")
-    parser.add_argument("--rerank-server", default="http://localhost:8000", help="vLLM server URL")
-    parser.add_argument("--rerank-model", default="nvidia/llama-nemotron-rerank-1b-v2", help="Reranker model name")
-    parser.add_argument("--no-rerank-server", action="store_true", help="Use HuggingFace instead of vLLM server")
+    parser.add_argument("--rerank", action="store_true", help="Enable reranking (uses BGE-Reranker-v2-M3 locally)")
     parser.add_argument("--top-k-rerank", type=int, default=5, help="Top documents after reranking")
     args = parser.parse_args()
 
@@ -273,9 +224,6 @@ if __name__ == "__main__":
         openai_model=args.openai_model,
         system_prompt=system_prompt,
         rerank=args.rerank,
-        rerank_server=args.rerank_server,
-        rerank_model=args.rerank_model,
-        use_server=not args.no_rerank_server,
         top_k_rerank=args.top_k_rerank,
     )
     interactive_chat(chain)
